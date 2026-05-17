@@ -1,0 +1,3 @@
+# DeepSeek Protocol Converter
+# 仅需要 Python 标准库，无需额外依赖
+# Python 3.8+
