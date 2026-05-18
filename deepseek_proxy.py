@@ -29,6 +29,40 @@ def convert_role(role):
     }
     return role_map.get(role, 'user')
 
+def convert_content_for_deepseek(content):
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        if content == "<image>" or content.startswith("<image name="):
+            return "[用户发送了一张图片]"
+        return content
+    if isinstance(content, list):
+        result = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type", "")
+                if item_type in ("input_text", "output_text", "text"):
+                    text = item.get("text", "")
+                    if text and text not in ("<image>", "<image name=[Image #1]>"):
+                        result.append({"type": "text", "text": text})
+                    elif text in ("<image>", "<image name=[Image #1]>"):
+                        pass
+                elif item_type in ("input_image", "image_url"):
+                    result.append({"type": "text", "text": "[用户发送了一张图片]"})
+                else:
+                    text = item.get("text", "") or item.get("content", "")
+                    if text and text not in ("<image>", "<image name=[Image #1]>"):
+                        result.append({"type": "text", "text": text})
+            elif isinstance(item, str):
+                if item not in ("<image>", "<image name=[Image #1]>"):
+                    result.append({"type": "text", "text": item})
+        if not result:
+            return ""
+        if len(result) == 1 and result[0]["type"] == "text":
+            return result[0]["text"]
+        return result
+    return str(content)
+
 def extract_text_content(content):
     if content is None:
         return ''
@@ -111,6 +145,26 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
             self.send_json_response({"error": "Invalid JSON"}, 400)
             return
 
+        # DEBUG: 打印完整的 input 内容（用于排查图片问题）
+        if 'input' in request_data:
+            for idx, item in enumerate(request_data.get('input', [])):
+                if isinstance(item, dict):
+                    content = item.get('content', '')
+                    if isinstance(content, list):
+                        for cidx, c in enumerate(content):
+                            if isinstance(c, dict) and c.get('type') not in ('input_text', 'output_text', 'text'):
+                                print(f"    [DEBUG] input[{idx}].content[{cidx}] = {json.dumps(c, ensure_ascii=False)[:500]}")
+                    elif isinstance(content, str) and ('image' in content.lower() or '<image>' in content):
+                        print(f"    [DEBUG] input[{idx}] contains image placeholder: {content[:200]}")
+            
+            # 保存完整请求到文件（用于分析图片数据）
+            try:
+                with open(r'C:\Users\long\.codex\proxy_debug_request.json', 'w', encoding='utf-8') as f:
+                    json.dump(request_data, f, ensure_ascii=False, indent=2)
+                print(f"    [DEBUG] 完整请求已保存到 proxy_debug_request.json")
+            except Exception as e:
+                print(f"    [DEBUG] 保存请求失败: {e}")
+
         if self.path in ('/responses', '/v1/responses'):
             self.handle_responses_api(request_data)
         elif self.path in ('/v1/chat/completions', '/chat/completions'):
@@ -121,7 +175,7 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
     def handle_responses_api(self, request_data):
         try:
             model = normalize_model(request_data.get('model', DEFAULT_MODEL))
-            
+
             stream = request_data.get('stream', True)
             tools = request_data.get('tools', [])
             tool_choice = request_data.get('tool_choice', 'auto')
@@ -136,6 +190,8 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
                 messages.append({"role": "system", "content": instructions})
             
             for item in request_data.get('input', []):
+                if not isinstance(item, dict):
+                    continue
                 role = convert_role(item.get('role', 'user'))
                 item_type = item.get('type', 'message')
                 
@@ -165,8 +221,8 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
                     }
                     messages.append(tool_result_msg)
                 else:
-                    content = extract_text_content(item.get('content', ''))
-                    if content:
+                    content = convert_content_for_deepseek(item.get('content', ''))
+                    if content or isinstance(content, list):
                         messages.append({"role": role, "content": content})
 
             if not messages:
