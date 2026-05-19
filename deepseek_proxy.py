@@ -43,18 +43,16 @@ def convert_content_for_deepseek(content):
                 item_type = item.get("type", "")
                 if item_type in ("input_text", "output_text", "text"):
                     text = item.get("text", "")
-                    if text and text not in ("<image>", "<image name=[Image #1]>"):
+                    if text and text != "<image>" and not text.startswith("<image name="):
                         result.append({"type": "text", "text": text})
-                    elif text in ("<image>", "<image name=[Image #1]>"):
-                        pass
                 elif item_type in ("input_image", "image_url"):
                     result.append({"type": "text", "text": "[用户发送了一张图片]"})
                 else:
                     text = item.get("text", "") or item.get("content", "")
-                    if text and text not in ("<image>", "<image name=[Image #1]>"):
+                    if text and text != "<image>" and not text.startswith("<image name="):
                         result.append({"type": "text", "text": text})
             elif isinstance(item, str):
-                if item not in ("<image>", "<image name=[Image #1]>"):
+                if item != "<image>" and not item.startswith("<image name="):
                     result.append({"type": "text", "text": item})
         if not result:
             return ""
@@ -159,7 +157,7 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
             
             # 保存完整请求到文件（用于分析图片数据）
             try:
-                with open(r'C:\Users\long\.codex\proxy_debug_request.json', 'w', encoding='utf-8') as f:
+                with open(os.path.join(os.path.expanduser('~'), '.codex', 'proxy_debug_request.json'), 'w', encoding='utf-8') as f:
                     json.dump(request_data, f, ensure_ascii=False, indent=2)
                 print(f"    [DEBUG] 完整请求已保存到 proxy_debug_request.json")
             except Exception as e:
@@ -324,7 +322,7 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
             traceback.print_exc()
             try:
                 self.send_json_response({"error": {"message": str(e)}}, 500)
-            except:
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
     def handle_streaming_response(self, chat_request, model):

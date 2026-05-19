@@ -1,6 +1,10 @@
 import sys, os, traceback
-os.environ['DEEPSEEK_API_KEY'] = 'sk-481740aa0afc4f429292b51a46ab0dfc'
-log = open(r'c:\Users\long\.codex\proxy_debug.log', 'w', encoding='utf-8')
+DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
+if not DEEPSEEK_API_KEY:
+    print('ERROR: DEEPSEEK_API_KEY 环境变量未设置，请先设置后再启动代理')
+    sys.exit(1)
+LOG_PATH = os.path.join(os.path.expanduser('~'), '.codex', 'proxy_debug.log')
+log = open(LOG_PATH, 'w', encoding='utf-8')
 class Tee:
     def __init__(self, *streams): self.streams = streams
     def write(self, data):
