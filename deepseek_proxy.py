@@ -46,7 +46,14 @@ def convert_content_for_deepseek(content):
                     if text and text != "<image>" and not text.startswith("<image name="):
                         result.append({"type": "text", "text": text})
                 elif item_type in ("input_image", "image_url"):
-                    result.append({"type": "text", "text": "[用户发送了一张图片]"})
+                    image_data = item.get("image_url", "")
+                    if image_data and isinstance(image_data, str) and (image_data.startswith("data:") or image_data.startswith("http://") or image_data.startswith("https://")):
+                        result.append({
+                            "type": "image_url",
+                            "image_url": {"url": image_data}
+                        })
+                    else:
+                        result.append({"type": "text", "text": "[用户发送了一张图片]"})
                 else:
                     text = item.get("text", "") or item.get("content", "")
                     if text and text != "<image>" and not text.startswith("<image name="):
