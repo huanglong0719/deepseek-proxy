@@ -1,0 +1,3 @@
+[submodule "vendor/ds2api-browser"]
+	path = vendor/ds2api-browser
+	url = https://github.com/huanglong0719/ds2api-browser.git

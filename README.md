@@ -1,6 +1,39 @@
 # DeepSeek Codex Proxy
 
-让 Codex 桌面版通过代理使用 DeepSeek API 的解决方案。
+让 Codex 桌面版通过代理使用 DeepSeek API 的解决方案，同时支持 DeepSeek 官方 API 的图片识别功能。
+
+## 架构概览
+
+```
+用户/客户端
+    │
+    ▼
+deepseek-proxy (端口 8765)  ← 本项目
+    │
+    ├── 无图片请求 ──────────→ DeepSeek 官方 API
+    │
+    └── 有图片请求 ──────────→ ds2api-browser (端口 8766)  ← 子模块
+                                │
+                                └── Chrome 浏览器自动化
+                                    └── 登录 DeepSeek 网页 → 识图模式
+                                    └── 捕获 SSE 响应 → 分离思考/回复内容
+```
+
+### 核心组件
+
+| 组件 | 仓库 | 说明 |
+|------|------|------|
+| **deepseek-proxy** | 本仓库 | Python 协议转换代理，负责路由分发和响应转换 |
+| **ds2api-browser** | [huanglong0719/ds2api-browser](https://github.com/huanglong0719/ds2api-browser) | Go + chromedp 浏览器自动化，处理图片识别 |
+
+### 图片识别流程
+
+1. 客户端发送请求到 `deepseek-proxy`（`/v1/responses`）
+2. 检测**最后一条用户消息**是否包含图片（多轮对话中历史图片不触发）
+3. 有图片 → 转发给 `ds2api-browser`
+4. `ds2api-browser` 通过 Chrome 操控 DeepSeek 网页版执行识图
+5. 捕获 SSE 响应，通过 `fragments[].type` 元数据分离思考内容和回复内容
+6. `deepseek-proxy` 将结果转为 SSE 流式响应返回客户端
 
 ## 功能特性
 
@@ -9,280 +42,102 @@
 - **自动配置还原**：关闭代理时自动恢复原始配置，不影响 Codex 原有设置
 - **异常保护**：即使通过 X 按钮强制关闭，下次启动时也会自动还原残留配置
 - **跨电脑迁移**：自动检测当前用户名，复制到新电脑可直接使用
+- **智能图片路由**：只检测最后一条用户消息，避免历史图片污染后续纯文本请求
+- **思考/回复分离**：通过解析 DeepSeek SSE 的 fragment type 标记，正确分离 thinking 和 content
 
 ## 系统要求
 
 - Windows 操作系统
 - Python 3.x（需要能运行 `python` 或 `py` 命令）
+- Chrome 浏览器（用于 ds2api-browser 图片识别）
+- DeepSeek 网页版账号（用于 ds2api-browser 登录）
 - Git（用于版本管理，如需推送到 GitHub）
 - OpenAI Codex 桌面版
+
+## 快速开始
+
+### 1. 克隆本仓库
+
+```bash
+git clone https://github.com/huanglong0719/deepseek-proxy.git
+cd deepseek-proxy
+```
+
+### 2. 克隆子模块（ds2api-browser）
+
+```bash
+git submodule update --init --recursive
+```
+
+### 3. 配置并启动 ds2api-browser
+
+```bash
+cd vendor/ds2api-browser
+cp browser_config.example.json browser_config.json
+# 编辑 browser_config.json，填入 DeepSeek 账号信息
+go build -o ds2api-browser.exe .
+./ds2api-browser.exe
+```
+
+### 4. 启动 deepseek-proxy
+
+```bash
+python deepseek_proxy.py
+```
+
+服务启动后监听 `http://127.0.0.1:8765`。
+
+## API 示例
+
+### 图片识别（通过 ds2api-browser）
+
+```bash
+curl http://127.0.0.1:8765/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-v4-pro",
+    "input": [{
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "这张图片里有什么？"},
+        {"type": "input_image", "image_url": "data:image/png;base64,..."}
+      ]
+    }]
+  }'
+```
+
+响应包含 SSE 流式事件，`reasoning` 事件携带思考内容，`output_text` 事件携带回复内容。
+
+### 纯文本聊天（直连 DeepSeek API）
+
+```bash
+curl http://127.0.0.1:8765/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "input": [{"role": "user", "content": [{"type": "input_text", "text": "你好"}]}]
+  }'
+```
 
 ## 文件说明
 
 ```
 deepseek-proxy/
-├── deepseek_proxy.py           # 代理核心模块
-├── run_proxy_debug3.py         # 代理启动脚本
-├── start_proxy_with_config.py  # 智能配置管家（核心）
-├── 启动代理服务器.bat          # Windows 快捷启动文件
-└── README.md                   # 本说明文档
+├── deepseek_proxy.py              # 代理核心模块
+├── README.md                      # 本说明文档
+└── vendor/
+    └── ds2api-browser/            # Git 子模块：浏览器图片识别服务
+        ├── main.go
+        ├── api/handler.go
+        ├── browser/
+        │   ├── chat.go            # 图片聊天核心逻辑
+        │   ├── injector.go        # SSE 拦截器（思考/回复分离）
+        │   └── session.go         # 浏览器会话管理
+        ├── config/config.go
+        └── browser_config.example.json
 ```
 
-## 快速开始
+## 关联项目
 
-### 1. 下载代码
-
-```bash
-git clone https://github.com/您的用户名/deepseek-proxy.git
-cd deepseek-proxy
-```
-
-### 2. 配置 API Key
-
-编辑 `run_proxy_debug3.py`，将 `DEEPSEEK_API_KEY` 替换为您的真实 API Key：
-
-```python
-os.environ['DEEPSEEK_API_KEY'] = 'sk-您的真实APIKey'
-```
-
-### 3. 启动代理
-
-双击运行 `启动代理服务器.bat`，或通过命令行：
-
-```bash
-python start_proxy_with_config.py
-```
-
-启动成功后会看到以下界面：
-
-```
-========================================
-   DeepSeek Proxy 智能配置启动工具
-========================================
-
-[*] 正在备份配置文件到 C:\Users\用户名\.codex\config.toml.bak...
-[+] 代理配置注入成功（含全局变量强制注入）。
-
-========================================
-   DeepSeek 代理服务器启动中...
-   当前用户: 用户名
-   (建议使用 Ctrl+C 正常关闭以立即还原配置)
-   (点击 X 强制关闭将在下次启动时自动还原)
-========================================
-
-============================================================
-DeepSeek Protocol Converter (Streaming) - RUNNING
-============================================================
-Port: 8765
-============================================================
-```
-
-### 4. 使用 DeepSeek
-
-启动代理后，打开 Codex 桌面版，即可使用 DeepSeek 模型进行对话。
-
-## 使用流程图
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  双击 启动代理服务器.bat                                   │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  启动前自检：检查是否有残留配置                            │
-│  ├─ 有残留 → 自动还原 → 进入下一步                         │
-│  └─ 无残留 → 直接进入下一步                                │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  备份当前 config.toml → config.toml.bak                   │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  注入 DeepSeek 代理配置到 config.toml                      │
-│  ├─ 强制设置 model_provider = "deepseek"                  │
-│  ├─ 强制设置 model = "deepseek-v4-flash"                 │
-│  └─ 添加 [model_providers.deepseek] 配置块                │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  启动代理服务器（端口 8765）                               │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  打开 Codex 桌面版 → 使用 DeepSeek 聊天                   │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  关闭代理窗口（Ctrl+C 或 X 按钮）                          │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  还原 config.toml.bak → config.toml                      │
-│  删除 config.toml.bak                                    │
-└─────────────────────────────────────────────────────────┘
-```
-
-## 关闭代理的方式
-
-### 推荐方式：Ctrl+C
-
-在代理窗口中按下 `Ctrl+C`，这是正常关闭：
-- 立即还原配置
-- 清理备份文件
-
-### 备选方式：点击 X 按钮
-
-点击窗口右上角的 X 按钮关闭：
-- 配置不会立即还原
-- 下次启动时会自动检测并还原残留配置
-
-### 异常情况处理
-
-如果因断电、死机等原因导致代理异常关闭：
-1. 重新运行 `启动代理服务器.bat`
-2. 脚本会显示 `[!] 检测到上次代理异常关闭`
-3. 自动还原配置后，再开始新的启动流程
-
-## 迁移到新电脑
-
-### 1. 复制文件
-
-将以下 3 个文件复制到新电脑的同一目录：
-- `deepseek_proxy.py`
-- `run_proxy_debug3.py`
-- `start_proxy_with_config.py`
-- `启动代理服务器.bat`（可选）
-
-### 2. 修改 API Key
-
-编辑 `run_proxy_debug3.py`，更新您的 DeepSeek API Key。
-
-### 3. 直接使用
-
-双击 `启动代理服务器.bat` 即可，脚本会自动检测当前用户名，无需手动配置路径。
-
-## 常见问题
-
-### Q: 发送图片后 AI 回复的内容与图片不符
-
-**原因**：DeepSeek API 目前**不支持图片输入功能**（仅网页版/客户端支持识图模式，API 未开放）。
-
-**当前行为**：
-- 发送图片时，代理会将图片转换为文字提示 `[用户发送了一张图片]`
-- AI 无法看到图片真实内容，可能会根据上下文"猜测"回复
-- **不会导致崩溃或错误**，基本对话和工具调用正常工作
-
-**建议**：
-- 如需图片识别功能，请使用支持视觉的模型（如 GPT-4o、Claude 等）
-- 或在 Codex 中直接使用 GPT 模型处理图片相关任务
-
-### Q: 双击 .bat 文件没有反应
-
-**原因**：系统找不到 Python 命令。
-
-**解决方法**：
-1. 确保已安装 Python
-2. 右键 `启动代理服务器.bat` → 选择「以管理员身份运行」
-3. 或直接运行 `py start_proxy_with_config.py`
-
-### Q: Codex 仍然在使用 GPT，不是 DeepSeek
-
-**原因**：可能是 Codex 在代理启动前就已经打开了。
-
-**解决方法**：
-1. 完全关闭 Codex
-2. 确保代理已在运行（黑窗口保持开启）
-3. 重新启动 Codex
-
-### Q: 提示「检测到上次代理异常关闭」
-
-**原因**：上次通过 X 按钮关闭了代理，配置未能及时还原。
-
-**解决方法**：这是正常现象，脚本会自动处理。下次请尽量使用 `Ctrl+C` 关闭。
-
-### Q: 代理启动成功但无法聊天
-
-**检查步骤**：
-1. 确认 DeepSeek API Key 正确且有效
-2. 检查网络连接是否正常
-3. 查看代理窗口的日志输出
-
-## 配置文件注入内容
-
-代理脚本会在 Codex 的 `config.toml` 中注入以下内容：
-
-```toml
-# 全局设置（强制注入）
-model_provider = "deepseek"
-model = "deepseek-v4-flash"
-
-# 提供商配置（新增块）
-[model_providers.deepseek]
-name = "DeepSeek"
-base_url = "http://127.0.0.1:8765/v1"
-wire_api = "responses"
-requires_openai_auth = true
-```
-
-## 技术原理
-
-### 代理工作原理
-
-```
-Codex 桌面版
-     │
-     │ 发送 OpenAI 格式请求
-     ▼
-deepseek_proxy.py (本地代理，端口 8765)
-     │
-     │ 转换为 DeepSeek 格式请求
-     ▼
-DeepSeek API (api.deepseek.com)
-```
-
-### 配置管理模式
-
-```
-┌──────────────┐      备份       ┌──────────────┐
-│ config.toml  │ ────────────→  │ config.toml  │
-│  (原始配置)   │                │   .bak       │
-└──────────────┘                └──────────────┘
-     ↑                              │
-     │         还原                  │
-     └──────────────────────────────┘
-```
-
-## 目录结构
-
-```
-C:\Users\用户名\.codex\
-├── config.toml           # Codex 主配置文件（会被脚本修改）
-├── config.toml.bak       # 备份文件（代理运行时存在，关闭后删除）
-└── proxy_debug.log        # 代理调试日志
-```
-
-## License
-
-MIT License
-
-## 更新日志
-
-### v1.1.0
-- 优化图片处理：发送图片不再导致崩溃，转为文字提示
-- 修复类型错误：处理非字典元素时的 AttributeError
-- 增强日志输出：使用无缓冲模式实时显示请求/响应
-- 新增图片限制说明：明确告知用户 DeepSeek API 不支持图片输入
-
-### v1.0.0
-- 实现代理核心功能
-- 支持配置自动注入与还原
-- 支持异常关闭保护
-- 自动检测用户名，跨电脑免配置使用
+- **[ds2api-browser](https://github.com/huanglong0719/ds2api-browser)** - Chrome 浏览器自动化图片识别服务（作为 git submodule 集成）
+- **[ds2api](https://github.com/huanglong0719/ds2api)** - 主项目，完整的 DeepSeek API 代理服务
