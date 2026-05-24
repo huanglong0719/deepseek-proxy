@@ -11,9 +11,12 @@ import urllib.error
 import sys
 import time
 import uuid
+import base64
+import tempfile
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+BROWSER_PROXY_URL = "http://127.0.0.1:8766/v1/chat/completions"
 PORT = 8765
 
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -29,6 +32,271 @@ def convert_role(role):
     }
     return role_map.get(role, 'user')
 
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "deepseek_proxy_files")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def save_base64_to_temp_file(data_url):
+    try:
+        if not data_url or not data_url.startswith("data:"):
+            return None
+        header_part, b64_part = data_url.split(",", 1)
+        mime_type = header_part.split(":")[1].split(";")[0] if ":" in header_part else "application/octet-stream"
+        ext_map = {
+            "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+            "image/webp": ".webp", "image/svg+xml": ".svg",
+            "application/pdf": ".pdf", "text/plain": ".txt",
+            "application/json": ".json", "text/csv": ".csv",
+            "application/zip": ".zip", "audio/mpeg": ".mp3",
+            "audio/wav": ".wav", "video/mp4": ".mp4"
+        }
+        ext = ext_map.get(mime_type, ".bin")
+        file_id = uuid.uuid4().hex[:12]
+        filename = f"file_{file_id}{ext}"
+        filepath = os.path.join(TEMP_DIR, filename)
+        raw_data = base64.b64decode(b64_part)
+        with open(filepath, "wb") as f:
+            f.write(raw_data)
+        print(f"    [FILE_SAVED] {filepath} ({len(raw_data)} bytes, {mime_type})")
+        return filepath
+    except Exception as e:
+        print(f"    [FILE_SAVE_ERROR] {e}")
+        return None
+
+def has_image_content(request_data):
+    input_items = request_data.get('input', [])
+    for item in reversed(input_items):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type', 'message')
+        role = item.get('role', '')
+        if item_type in ('function_call', 'function_call_output'):
+            continue
+        if role != 'user':
+            continue
+        content = item.get('content', '')
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get('type') in ('input_image', 'image_url'):
+                    return True
+        elif isinstance(content, dict) and content.get('type') in ('input_image', 'image_url'):
+            return True
+        return False
+    return False
+
+def has_image_in_messages(messages):
+    for msg in messages:
+        content = msg.get('content', '')
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get('type') in ('input_image', 'image_url'):
+                    return True
+    return False
+
+def build_image_chat_request(request_data):
+    messages = []
+    instructions = request_data.get('instructions', '')
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+
+    input_items = request_data.get('input', [])
+
+    last_user_idx = -1
+    for i in range(len(input_items) - 1, -1, -1):
+        item = input_items[i]
+        if not isinstance(item, dict):
+            continue
+        if item.get('type', 'message') in ('function_call', 'function_call_output'):
+            continue
+        if item.get('role', '') == 'user':
+            last_user_idx = i
+            break
+
+    for idx, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type', 'message')
+        if item_type in ('function_call', 'function_call_output'):
+            continue
+        role = convert_role(item.get('role', 'user'))
+        content = item.get('content', '')
+        if not isinstance(content, list):
+            continue
+        parts = []
+        is_last_user = (idx == last_user_idx)
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            ct = c.get('type', '')
+            if ct in ('input_image', 'image_url'):
+                if is_last_user:
+                    image_url = c.get('image_url', '') or c.get('url', '')
+                    if isinstance(image_url, dict):
+                        image_url = image_url.get('url', '')
+                    if image_url and isinstance(image_url, str):
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": image_url}
+                        })
+            elif ct in ('input_text', 'output_text', 'text'):
+                text_val = c.get('text', '')
+                if text_val:
+                    parts.append({"type": "text", "text": text_val})
+        if parts:
+            messages.append({"role": role, "content": parts})
+
+    return {
+        "model": "deepseek-v4-pro",
+        "messages": messages
+    }
+
+def forward_image_to_browser(chat_request):
+    data = json.dumps(chat_request).encode('utf-8')
+    req = urllib.request.Request(BROWSER_PROXY_URL, data=data, method='POST')
+    req.add_header('Content-Type', 'application/json')
+    req.add_header('Authorization', 'Bearer sk-browser-proxy-key-2026')
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+def send_image_streaming_response(self, browser_resp, model):
+    print(f"    [SSE_STREAM] starting SSE stream...")
+    sys.stdout.flush()
+    choices = browser_resp.get('choices', [])
+    message = choices[0].get('message', {}) if choices else {}
+    content = message.get('content', '')
+    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    evt_id = f"evt_{uuid.uuid4().hex[:24]}"
+
+    self.send_response(200)
+    self.send_header('Content-Type', 'text/event-stream')
+    self.send_header('Cache-Control', 'no-cache')
+    self.send_header('Connection', 'keep-alive')
+    self.send_header('Access-Control-Allow-Origin', '*')
+    self.end_headers()
+
+    def send_event(event_type, data):
+        event_data = json.dumps(data, ensure_ascii=False)
+        self.wfile.write(f"event: {event_type}\ndata: {event_data}\n\n".encode('utf-8'))
+        self.wfile.flush()
+
+    send_event("response.created", {
+        "type": "response.created",
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": model,
+            "status": "in_progress",
+            "output": []
+        }
+    })
+
+    send_event("response.output_item.added", {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": []
+        }
+    })
+
+    send_event("response.content_part.added", {
+        "type": "response.content_part.added",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": ""}
+    })
+
+    send_event("response.output_text.delta", {
+        "type": "response.output_text.delta",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": content
+    })
+
+    send_event("response.output_text.done", {
+        "type": "response.output_text.done",
+        "output_index": 0,
+        "content_index": 0,
+        "text": content
+    })
+
+    send_event("response.content_part.done", {
+        "type": "response.content_part.done",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": content}
+    })
+
+    send_event("response.output_item.done", {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": content}]
+        }
+    })
+
+    send_event("response.completed", {
+        "type": "response.completed",
+        "event_id": evt_id,
+        "response": {
+            "id": resp_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": model,
+            "status": "completed",
+            "incomplete_details": None,
+            "output": [{
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": content}]
+            }],
+            "usage": browser_resp.get('usage', {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0
+            }),
+            "metadata": {}
+        }
+    })
+
+    time.sleep(0.3)
+    self.close_connection = True
+    print(f"    [SSE_STREAM] done, {len(content)} chars")
+
+def convert_browser_response_to_codex(browser_resp, model):
+    choices = browser_resp.get('choices', [])
+    message = choices[0].get('message', {}) if choices else {}
+    content = message.get('content', '')
+    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": browser_resp.get('created', int(time.time())),
+        "model": model or "deepseek-v4-pro",
+        "output": [{
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": content}]
+        }],
+        "usage": browser_resp.get('usage', {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0
+        }),
+        "status": "completed"
+    }
 def convert_content_for_deepseek(content):
     if content is None:
         return ""
@@ -47,13 +315,18 @@ def convert_content_for_deepseek(content):
                         result.append({"type": "text", "text": text})
                 elif item_type in ("input_image", "image_url"):
                     image_data = item.get("image_url", "")
-                    if image_data and isinstance(image_data, str) and (image_data.startswith("data:") or image_data.startswith("http://") or image_data.startswith("https://")):
-                        result.append({
-                            "type": "image_url",
-                            "image_url": {"url": image_data}
-                        })
+                    if isinstance(image_data, dict):
+                        image_data = image_data.get("url", "")
+                    if image_data and isinstance(image_data, str) and image_data.startswith("data:"):
+                        saved_path = save_base64_to_temp_file(image_data)
+                        if saved_path:
+                            result.append({"type": "text", "text": f"[用户发送了一个文件(已保存到本地): {saved_path}]"})
+                        else:
+                            result.append({"type": "text", "text": "[用户发送了一个文件，但保存失败]"})
+                    elif image_data and isinstance(image_data, str) and (image_data.startswith("http://") or image_data.startswith("https://")):
+                        result.append({"type": "text", "text": f"[用户发送了一个网络文件链接: {image_data}]"})
                     else:
-                        result.append({"type": "text", "text": "[用户发送了一张图片]"})
+                        result.append({"type": "text", "text": "[用户发送了一个文件]"})
                 else:
                     text = item.get("text", "") or item.get("content", "")
                     if text and text != "<image>" and not text.startswith("<image name="):
@@ -110,7 +383,7 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
         response = json.dumps(data, ensure_ascii=False)
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', len(response))
+        self.send_header('Content-Length', len(response.encode('utf-8')))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(response.encode('utf-8'))
@@ -181,6 +454,182 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
         try:
             model = normalize_model(request_data.get('model', DEFAULT_MODEL))
 
+            if has_image_content(request_data):
+                print(f"    [IMAGE_DETECTED] routing to browser proxy at {BROWSER_PROXY_URL}")
+                try:
+                    chat_req = build_image_chat_request(request_data)
+                    print(f"    [BROWSER_FWD] sending {len(str(chat_req))} byte request")
+                    browser_resp = forward_image_to_browser(chat_req)
+                    print(f"    [BROWSER_RESP] got {len(browser_resp.get('choices',[]) or [])} choices")
+                    choices = browser_resp.get('choices', [])
+                    message = choices[0].get('message', {}) if choices else {}
+                    content = message.get('content', '')
+                    thinking = message.get('reasoning_content', '')
+
+                    resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+                    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.send_header('Connection', 'keep-alive')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+
+                    seq = [0]
+                    def next_seq():
+                        seq[0] += 1
+                        return seq[0]
+
+                    def sse(event_type, data):
+                        data["sequence_number"] = next_seq()
+                        d = json.dumps(data, ensure_ascii=False)
+                        self.wfile.write(f"event: {event_type}\ndata: {d}\n\n".encode('utf-8'))
+                        self.wfile.flush()
+
+                    sse("response.created", {
+                        "type": "response.created",
+                        "id": resp_id,
+                        "response_id": resp_id,
+                        "object": "response",
+                        "model": model,
+                        "status": "in_progress",
+                    })
+
+                    sse("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "id": resp_id,
+                        "response_id": resp_id,
+                        "output_index": 0,
+                        "item_id": msg_id,
+                        "item": {"id": msg_id, "type": "message", "role": "assistant", "content": []},
+                    })
+
+                    has_thinking = thinking and thinking.strip()
+                    has_text = content and content.strip()
+
+                    if has_thinking:
+                        sse("response.content_part.added", {
+                            "type": "response.content_part.added",
+                            "id": resp_id,
+                            "response_id": resp_id,
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {"type": "reasoning", "text": ""},
+                        })
+
+                        sse("response.reasoning.delta", {
+                            "type": "response.reasoning.delta",
+                            "id": resp_id,
+                            "response_id": resp_id,
+                            "delta": thinking,
+                        })
+
+                        sse("response.content_part.done", {
+                            "type": "response.content_part.done",
+                            "id": resp_id,
+                            "response_id": resp_id,
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {"type": "reasoning", "text": thinking},
+                        })
+
+                        text_content_index = 1
+                    else:
+                        text_content_index = 0
+
+                    if has_text:
+                        sse("response.content_part.added", {
+                            "type": "response.content_part.added",
+                            "id": resp_id,
+                            "response_id": resp_id,
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": text_content_index,
+                            "part": {"type": "output_text", "text": ""},
+                        })
+
+                        chunk_size = 50
+                        chars = list(content)
+                        for i in range(0, len(chars), chunk_size):
+                            chunk = ''.join(chars[i:i+chunk_size])
+                            sse("response.output_text.delta", {
+                                "type": "response.output_text.delta",
+                                "id": resp_id,
+                                "response_id": resp_id,
+                                "item_id": msg_id,
+                                "output_index": 0,
+                                "content_index": text_content_index,
+                                "delta": chunk,
+                            })
+                            if i + chunk_size < len(chars):
+                                time.sleep(0.01)
+
+                        sse("response.output_text.done", {
+                            "type": "response.output_text.done",
+                            "id": resp_id,
+                            "response_id": resp_id,
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": text_content_index,
+                            "text": content,
+                        })
+
+                        sse("response.content_part.done", {
+                            "type": "response.content_part.done",
+                            "id": resp_id,
+                            "response_id": resp_id,
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": text_content_index,
+                            "part": {"type": "output_text", "text": content},
+                        })
+
+                    output_content = []
+                    if has_thinking:
+                        output_content.append({"type": "reasoning", "text": thinking})
+                    if has_text:
+                        output_content.append({"type": "output_text", "text": content})
+
+                    sse("response.output_item.done", {
+                        "type": "response.output_item.done",
+                        "id": resp_id,
+                        "response_id": resp_id,
+                        "output_index": 0,
+                        "item_id": msg_id,
+                        "item": {"id": msg_id, "type": "message", "role": "assistant", "status": "completed", "content": output_content},
+                    })
+
+                    response_obj = {
+                        "id": resp_id,
+                        "object": "response",
+                        "created_at": int(time.time()),
+                        "model": model,
+                        "status": "completed",
+                        "incomplete_details": None,
+                        "output": [{"id": msg_id, "type": "message", "role": "assistant", "status": "completed", "content": output_content}],
+                        "usage": browser_resp.get('usage', {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+                        "metadata": {},
+                    }
+                    sse("response.completed", {
+                        "type": "response.completed",
+                        "response_id": resp_id,
+                        "response": response_obj,
+                    })
+
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    self.close_connection = True
+                    print(f"    [SSE_STREAM] done, content={len(content)}chars, thinking={len(thinking)}chars")
+                    return
+                except Exception as e:
+                    print(f"    [BROWSER_ERR] {e}")
+                    self.send_json_response(
+                        {"error": f"Image recognition failed: {str(e)}"}, 502)
+                    return
+
             stream = request_data.get('stream', True)
             tools = request_data.get('tools', [])
             tool_choice = request_data.get('tool_choice', 'auto')
@@ -216,7 +665,35 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
                     messages.append(tool_call_msg)
                 elif item_type == 'function_call_output':
                     call_id = item.get('call_id', '')
-                    content = extract_text_content(item.get('output', ''))
+                    raw_output = item.get('output', '')
+                    print(f"    [DEBUG_FUNC_OUTPUT] call_id={call_id} output_type={type(raw_output).__name__} output_len={len(raw_output) if raw_output else 0}")
+                    if isinstance(raw_output, dict):
+                        print(f"    [DEBUG_FUNC_OUTPUT] output_keys={list(raw_output.keys())}")
+                        for k, v in raw_output.items():
+                            vpreview = str(v)[:200] if v else '(None)'
+                            print(f"    [DEBUG_FUNC_OUTPUT]   {k} type={type(v).__name__} preview={vpreview}")
+                    elif isinstance(raw_output, list):
+                        print(f"    [DEBUG_FUNC_OUTPUT] output_list_len={len(raw_output)}")
+                        for idx, vi in enumerate(raw_output[:3]):
+                            print(f"    [DEBUG_FUNC_OUTPUT]   [{idx}] type={type(vi).__name__} preview={str(vi)[:200]}")
+                    elif isinstance(raw_output, str):
+                        print(f"    [DEBUG_FUNC_OUTPUT] output_str_preview={raw_output[:300]}")
+                    else:
+                        print(f"    [DEBUG_FUNC_OUTPUT] raw_output_value={raw_output}")
+                    content = extract_text_content(raw_output)
+                    is_image_output = False
+                    if not content and raw_output:
+                        if isinstance(raw_output, list):
+                            for item in raw_output:
+                                if isinstance(item, dict) and item.get('type') in ('input_image', 'image_url'):
+                                    is_image_output = True
+                                    break
+                        content = convert_content_for_deepseek(raw_output)
+                        if content and is_image_output:
+                            content = '[IMAGE_VIEW_RESULT] ' + content + ' -- 这是你请求查看的图片，请基于图片内容回答用户问题。'
+                            print(f"    [DEBUG_FUNC_OUTPUT] image output converted, result={content[:200]}")
+                        elif content:
+                            print(f"    [DEBUG_FUNC_OUTPUT] fallback to convert_content_for_deepseek, result={str(content)[:150]}")
                     if not call_id:
                         print(f"    WARNING: function_call_output missing call_id, output={content[:50]}")
                     tool_result_msg = {
@@ -602,10 +1079,22 @@ class ProtocolHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_chat_completions(self, request_data):
         try:
+            if has_image_in_messages(request_data.get('messages', [])):
+                print(f"    [IMAGE_DETECTED_CHAT] routing to browser proxy")
+                try:
+                    browser_resp = forward_image_to_browser(request_data)
+                    converted = convert_browser_response_to_codex(browser_resp, request_data.get('model', ''))
+                    self.send_json_response(converted)
+                    return
+                except Exception as e:
+                    print(f"    [BROWSER_CHAT_ERR] {e}")
+                    self.send_json_response(
+                        {"error": f"Image recognition failed: {str(e)}"}, 502)
+                    return
             request_data['model'] = normalize_model(request_data.get('model', DEFAULT_MODEL))
             for msg in request_data.get('messages', []):
                 msg['role'] = convert_role(msg.get('role', 'user'))
-                msg['content'] = extract_text_content(msg.get('content', ''))
+                msg['content'] = convert_content_for_deepseek(msg.get('content', ''))
             response = self.call_deepseek(request_data)
             self.send_json_response(response)
         except Exception as e:
